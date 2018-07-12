@@ -26,7 +26,7 @@ func (b *Local) opApply(
 
 	// If we have a nil module at this point, then set it to an empty tree
 	// to avoid any potential crashes.
-	if op.Plan == nil && !op.Destroy && !op.HasConfig() {
+	if op.PlanFile == nil && !op.Destroy && !op.HasConfig() {
 		diags = diags.Append(tfdiags.Sourceless(
 			tfdiags.Error,
 			"No configuration files",
@@ -58,7 +58,7 @@ func (b *Local) opApply(
 	runningOp.State = tfCtx.State()
 
 	// If we weren't given a plan, then we refresh/plan
-	if op.Plan == nil {
+	if op.PlanFile == nil {
 		// If we're refreshing before apply, perform that
 		if op.PlanRefresh {
 			log.Printf("[INFO] backend/local: apply calling Refresh")

@@ -25,7 +25,7 @@ func (b *Local) opPlan(
 
 	var diags tfdiags.Diagnostics
 
-	if b.CLI != nil && op.Plan != nil {
+	if b.CLI != nil && op.PlanFile != nil {
 		diags = diags.Append(tfdiags.Sourceless(
 			tfdiags.Error,
 			"Can't re-plan a saved plan",

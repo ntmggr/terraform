@@ -15,16 +15,18 @@ import (
 	"github.com/hashicorp/errwrap"
 	"github.com/hashicorp/hcl2/hcl"
 	"github.com/hashicorp/hcl2/hcldec"
+	"github.com/zclconf/go-cty/cty"
+	ctyjson "github.com/zclconf/go-cty/cty/json"
+
 	"github.com/hashicorp/terraform/backend"
 	backendinit "github.com/hashicorp/terraform/backend/init"
 	backendlocal "github.com/hashicorp/terraform/backend/local"
 	"github.com/hashicorp/terraform/command/clistate"
 	"github.com/hashicorp/terraform/configs"
+	"github.com/hashicorp/terraform/plans"
 	"github.com/hashicorp/terraform/state"
 	"github.com/hashicorp/terraform/terraform"
 	"github.com/hashicorp/terraform/tfdiags"
-	"github.com/zclconf/go-cty/cty"
-	ctyjson "github.com/zclconf/go-cty/cty/json"
 )
 
 // BackendOpts are the options used to initialize a backend.Backend.
@@ -37,10 +39,6 @@ type BackendOpts struct {
 	// configs.MergeBodies to override the type-specific backend configuration
 	// arguments in Config.
 	ConfigOverride hcl.Body
-
-	// Plan is a plan that is being used. If this is set, the backend
-	// configuration and output configuration will come from this plan.
-	Plan *terraform.Plan
 
 	// Init should be set to true if initialization is allowed. If this is
 	// false, then any configuration that requires configuration will show
@@ -78,17 +76,9 @@ func (m *Meta) Backend(opts *BackendOpts) (backend.Enhanced, tfdiags.Diagnostics
 	// local operation.
 	var b backend.Backend
 	if !opts.ForceLocal {
-		// If we have a plan then, we get the the backend from there. Otherwise,
-		// the backend comes from the configuration.
-		if opts.Plan != nil {
-			var backendDiags tfdiags.Diagnostics
-			b, backendDiags = m.backendFromPlan(opts)
-			diags = diags.Append(backendDiags)
-		} else {
-			var backendDiags tfdiags.Diagnostics
-			b, backendDiags = m.backendFromConfig(opts)
-			diags = diags.Append(backendDiags)
-		}
+		var backendDiags tfdiags.Diagnostics
+		b, backendDiags = m.backendFromConfig(opts)
+		diags = diags.Append(backendDiags)
 
 		if diags.HasErrors() {
 			return nil, diags
@@ -98,22 +88,8 @@ func (m *Meta) Backend(opts *BackendOpts) (backend.Enhanced, tfdiags.Diagnostics
 	}
 
 	// Setup the CLI opts we pass into backends that support it
-	cliOpts := &backend.CLIOpts{
-		CLI:                 m.Ui,
-		CLIColor:            m.Colorize(),
-		ShowDiagnostics:     m.showDiagnostics,
-		StatePath:           m.statePath,
-		StateOutPath:        m.stateOutPath,
-		StateBackupPath:     m.backupPath,
-		ContextOpts:         m.contextOpts(),
-		Input:               m.Input(),
-		RunningInAutomation: m.RunningInAutomation,
-	}
-
-	// Don't validate if we have a plan.  Validation is normally harmless here,
-	// but validation requires interpolation, and `file()` function calls may
-	// not have the original files in the current execution context.
-	cliOpts.Validation = opts.Plan == nil
+	cliOpts := m.backendCLIOpts()
+	cliOpts.Validation = true
 
 	// If the backend supports CLI initialization, do it.
 	if cli, ok := b.(backend.CLI); ok {
@@ -149,6 +125,73 @@ func (m *Meta) Backend(opts *BackendOpts) (backend.Enhanced, tfdiags.Diagnostics
 	}
 
 	return local, nil
+}
+
+// BackendForPlan is similar to Backend, but uses backend settings that were
+// stored in a plan.
+//
+// The current workspace name is also stored as part of the plan, and so this
+// method will check that it matches the currently-selected workspace name
+// and produce error diagnostics if not.
+func (m *Meta) BackendForPlan(settings plans.Backend) (backend.Enhanced, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
+
+	f := backendinit.Backend(settings.Type)
+	if f == nil {
+		diags = diags.Append(fmt.Errorf(strings.TrimSpace(errBackendSavedUnknown), settings.Type))
+		return nil, diags
+	}
+	b := f()
+
+	schema := b.ConfigSchema()
+	configVal, err := settings.Config.Decode(schema.ImpliedType())
+	if err != nil {
+		diags = diags.Append(errwrap.Wrapf("saved backend configuration is invalid: {{err}}", err))
+		return nil, diags
+	}
+
+	validateDiags := b.ValidateConfig(configVal)
+	diags = diags.Append(validateDiags)
+	if validateDiags.HasErrors() {
+		return nil, diags
+	}
+
+	configureDiags := b.Configure(configVal)
+	diags = diags.Append(configureDiags)
+
+	// If the result of loading the backend is an enhanced backend,
+	// then return that as-is. This works even if b == nil (it will be !ok).
+	if enhanced, ok := b.(backend.Enhanced); ok {
+		return enhanced, nil
+	}
+
+	// Otherwise, we'll wrap our state-only remote backend in the local backend
+	// to cause any operations to be run locally.
+	cliOpts := m.backendCLIOpts()
+	cliOpts.Validation = false // don't validate here in case config contains file(...) calls where the file doesn't exist
+	local := &backendlocal.Local{Backend: b}
+	if err := local.CLIInit(cliOpts); err != nil {
+		// Local backend should never fail, so this is always a bug.
+		panic(err)
+	}
+
+	return local, diags
+}
+
+// backendCLIOpts returns a backend.CLIOpts object that should be passed to
+// a backend that supports local CLI operations.
+func (m *Meta) backendCLIOpts() *backend.CLIOpts {
+	return &backend.CLIOpts{
+		CLI:                 m.Ui,
+		CLIColor:            m.Colorize(),
+		ShowDiagnostics:     m.showDiagnostics,
+		StatePath:           m.statePath,
+		StateOutPath:        m.stateOutPath,
+		StateBackupPath:     m.backupPath,
+		ContextOpts:         m.contextOpts(),
+		Input:               m.Input(),
+		RunningInAutomation: m.RunningInAutomation,
+	}
 }
 
 // IsLocalBackend returns true if the backend is a local backend. We use this
@@ -426,176 +469,6 @@ func (m *Meta) backendFromConfig(opts *BackendOpts) (backend.Backend, tfdiags.Di
 		))
 		return nil, diags
 	}
-}
-
-// backendFromPlan loads the backend from a given plan file.
-func (m *Meta) backendFromPlan(opts *BackendOpts) (backend.Backend, tfdiags.Diagnostics) {
-	if opts.Plan == nil {
-		panic("plan should not be nil")
-	}
-
-	var diags tfdiags.Diagnostics
-
-	// We currently don't allow "-state" to be specified.
-	if m.statePath != "" {
-		diags = diags.Append(fmt.Errorf(
-			"State path cannot be specified with a plan file. The plan itself contains\n" +
-				"the state to use. If you wish to change that, please create a new plan\n" +
-				"and specify the state path when creating the plan.",
-		))
-	}
-
-	planBackend := opts.Plan.Backend
-	planState := opts.Plan.State
-	if planState == nil {
-		// The state can be nil, we just have to make it empty for the logic
-		// in this function.
-		planState = terraform.NewState()
-	}
-
-	// Validation only for non-local plans
-	local := planState.Remote.Empty() && planBackend.Empty()
-	if !local {
-		// We currently don't allow "-state-out" to be specified.
-		if m.stateOutPath != "" {
-			diags = diags.Append(fmt.Errorf(strings.TrimSpace(errBackendPlanStateFlag)))
-			return nil, diags
-		}
-	}
-
-	// If we have a stateOutPath, we must also specify it as the
-	// input path so we can check it properly. We restore it after this
-	// function exits.
-	original := m.statePath
-	m.statePath = m.stateOutPath
-	defer func() { m.statePath = original }()
-
-	var b backend.Backend
-	switch {
-	// No remote state at all, all local
-	case planState.Remote.Empty() && planBackend.Empty():
-		log.Printf("[INFO] command: initializing local backend from plan (not set)")
-
-		// Get the local backend
-		var backendDiags tfdiags.Diagnostics
-		b, backendDiags = m.Backend(&BackendOpts{ForceLocal: true})
-		diags = diags.Append(backendDiags)
-
-	// New backend configuration set
-	case planState.Remote.Empty() && !planBackend.Empty():
-		log.Printf(
-			"[INFO] command: initializing backend from plan: %s",
-			planBackend.Type)
-
-		var backendDiags tfdiags.Diagnostics
-		b, backendDiags = m.backendInitFromSaved(planBackend)
-		diags = diags.Append(backendDiags)
-
-	// Legacy remote state set
-	case !planState.Remote.Empty() && planBackend.Empty():
-		log.Printf(
-			"[INFO] command: initializing legacy remote backend from plan: %s",
-			planState.Remote.Type)
-
-		// Write our current state to an inmemory state just so that we
-		// have it in the format of state.State
-		inmem := &state.InmemState{}
-		inmem.WriteState(planState)
-
-		// Get the backend through the normal means of legacy state
-		var moreDiags tfdiags.Diagnostics
-		b, moreDiags = m.backend_c_R_s(nil, inmem)
-		diags = diags.Append(moreDiags)
-
-	// Both set, this can't happen in a plan.
-	case !planState.Remote.Empty() && !planBackend.Empty():
-		diags = diags.Append(fmt.Errorf(strings.TrimSpace(errBackendPlanBoth)))
-		return nil, diags
-	}
-
-	// If we had an error, return that
-	if diags.HasErrors() {
-		return nil, diags
-	}
-
-	env := m.Workspace()
-
-	// Get the state so we can determine the effect of using this plan
-	realMgr, err := b.State(env)
-	if err != nil {
-		diags = diags.Append(fmt.Errorf("Error reading state: %s", err))
-		return nil, diags
-	}
-
-	if m.stateLock {
-		stateLocker := clistate.NewLocker(context.Background(), m.stateLockTimeout, m.Ui, m.Colorize())
-		if err := stateLocker.Lock(realMgr, "backend from plan"); err != nil {
-			diags = diags.Append(fmt.Errorf("Error locking state: %s", err))
-			return nil, diags
-		}
-		defer stateLocker.Unlock(nil)
-	}
-
-	if err := realMgr.RefreshState(); err != nil {
-		diags = diags.Append(fmt.Errorf("Error reading state: %s", err))
-		return nil, diags
-	}
-	real := realMgr.State()
-	if real != nil {
-		// If they're not the same lineage, don't allow this
-		if !real.SameLineage(planState) {
-			diags = diags.Append(fmt.Errorf(strings.TrimSpace(errBackendPlanLineageDiff)))
-			return nil, diags
-		}
-
-		// Compare ages
-		comp, err := real.CompareAges(planState)
-		if err != nil {
-			diags = diags.Append(fmt.Errorf("Error comparing state ages for safety: %s", err))
-			return nil, diags
-		}
-		switch comp {
-		case terraform.StateAgeEqual:
-			// State ages are equal, this is perfect
-
-		case terraform.StateAgeReceiverOlder:
-			// Real state is somehow older, this is okay.
-
-		case terraform.StateAgeReceiverNewer:
-			// If we have an older serial it is a problem but if we have a
-			// differing serial but are still identical, just let it through.
-			if real.Equal(planState) {
-				log.Printf("[WARN] command: state in plan has older serial, but Equal is true")
-				break
-			}
-
-			// The real state is newer, this is not allowed.
-			diags = diags.Append(fmt.Errorf(
-				strings.TrimSpace(errBackendPlanOlder),
-				planState.Serial, real.Serial,
-			))
-			return nil, diags
-		}
-	}
-
-	// Write the state
-	newState := opts.Plan.State.DeepCopy()
-	if newState != nil {
-		newState.Remote = nil
-		newState.Backend = nil
-	}
-
-	// realMgr locked above
-	if err := realMgr.WriteState(newState); err != nil {
-		diags = diags.Append(fmt.Errorf("Error writing state: %s", err))
-		return nil, diags
-	}
-	if err := realMgr.PersistState(); err != nil {
-		diags = diags.Append(fmt.Errorf("Error writing state: %s", err))
-		return nil, diags
-	}
-
-	return b, diags
 }
 
 //-------------------------------------------------------------------

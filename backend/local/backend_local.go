@@ -2,15 +2,17 @@ package local
 
 import (
 	"context"
-
-	"github.com/hashicorp/terraform/command/clistate"
-
-	"github.com/hashicorp/terraform/tfdiags"
+	"fmt"
 
 	"github.com/hashicorp/errwrap"
+
 	"github.com/hashicorp/terraform/backend"
+	"github.com/hashicorp/terraform/command/clistate"
+	"github.com/hashicorp/terraform/configs/configload"
+	"github.com/hashicorp/terraform/plans/planfile"
 	"github.com/hashicorp/terraform/state"
 	"github.com/hashicorp/terraform/terraform"
+	"github.com/hashicorp/terraform/tfdiags"
 )
 
 // backend.Local implementation.
@@ -31,18 +33,16 @@ func (b *Local) Context(op *backend.Operation) (*terraform.Context, state.State,
 func (b *Local) context(op *backend.Operation) (*terraform.Context, state.State, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 
-	// Get the state.
+	// Get the latest state.
 	s, err := b.State(op.Workspace)
 	if err != nil {
 		diags = diags.Append(errwrap.Wrapf("Error loading state: {{err}}", err))
 		return nil, nil, diags
 	}
-
 	if err := op.StateLocker.Lock(s, op.Type.String()); err != nil {
 		diags = diags.Append(errwrap.Wrapf("Error locking state: {{err}}", err))
 		return nil, nil, diags
 	}
-
 	if err := s.RefreshState(); err != nil {
 		diags = diags.Append(errwrap.Wrapf("Error loading state: {{err}}", err))
 		return nil, nil, diags
@@ -59,48 +59,28 @@ func (b *Local) context(op *backend.Operation) (*terraform.Context, state.State,
 	opts.Targets = op.Targets
 	opts.UIInput = op.UIIn
 
-	// Load the configuration using the caller-provided configuration loader.
-	config, configDiags := op.ConfigLoader.LoadConfig(op.ConfigDir)
-	diags = diags.Append(configDiags)
-	if configDiags.HasErrors() {
-		return nil, nil, diags
-	}
-	opts.Config = config
-
-	variables, varDiags := backend.ParseVariableValues(op.Variables, config.Module.Variables)
-	diags = diags.Append(varDiags)
-	if diags.HasErrors() {
-		return nil, nil, diags
-	}
-	if op.Variables != nil {
-		opts.Variables = variables
-	}
-
-	// Load our state
-	// By the time we get here, the backend creation code in "command" took
-	// care of making s.State() return a state compatible with our plan,
-	// if any, so we can safely pass this value in both the plan context
-	// and new context cases below.
+	// Load the latest state. If we enter contextFromPlanFile below then the
+	// state snapshot in the plan file must match this.
 	opts.State = s.State()
 
-	// Build the context
 	var tfCtx *terraform.Context
 	var ctxDiags tfdiags.Diagnostics
-	if op.Plan != nil {
-		tfCtx, ctxDiags = op.Plan.Context(&opts)
+	if op.PlanFile != nil {
+		var configSources map[string][]byte
+		tfCtx, configSources, ctxDiags = b.contextFromPlanFile(op.PlanFile, opts)
+		// Write sources into the cache of the main loader so that they are
+		// available if we need to generate diagnostic message snippets.
+		op.ConfigLoader.ImportSources(configSources)
 	} else {
-		tfCtx, ctxDiags = terraform.NewContext(&opts)
+		tfCtx, ctxDiags = b.contextDirect(op, opts)
 	}
 	diags = diags.Append(ctxDiags)
-	if ctxDiags.HasErrors() {
-		return nil, nil, diags
-	}
 
 	// If we have an operation, then we automatically do the input/validate
 	// here since every option requires this.
 	if op.Type != backend.OperationTypeInvalid {
 		// If input asking is enabled, then do that
-		if op.Plan == nil && b.OpInput {
+		if op.PlanFile == nil && b.OpInput {
 			mode := terraform.InputModeProvider
 			mode |= terraform.InputModeVar
 			mode |= terraform.InputModeVarUnset
@@ -120,6 +100,103 @@ func (b *Local) context(op *backend.Operation) (*terraform.Context, state.State,
 	}
 
 	return tfCtx, s, diags
+}
+
+func (b *Local) contextDirect(op *backend.Operation, opts terraform.ContextOpts) (*terraform.Context, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
+
+	// Load the configuration using the caller-provided configuration loader.
+	config, configDiags := op.ConfigLoader.LoadConfig(op.ConfigDir)
+	diags = diags.Append(configDiags)
+	if configDiags.HasErrors() {
+		return nil, diags
+	}
+	opts.Config = config
+
+	variables, varDiags := backend.ParseVariableValues(op.Variables, config.Module.Variables)
+	diags = diags.Append(varDiags)
+	if diags.HasErrors() {
+		return nil, diags
+	}
+	if op.Variables != nil {
+		opts.Variables = variables
+	}
+
+	tfCtx, ctxDiags := terraform.NewContext(&opts)
+	diags = diags.Append(ctxDiags)
+	return tfCtx, diags
+}
+
+func (b *Local) contextFromPlanFile(pf *planfile.Reader, opts terraform.ContextOpts) (*terraform.Context, map[string][]byte, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
+
+	const errSummary = "Invalid plan file"
+
+	// A plan file has a snapshot of configuration embedded inside it, which
+	// is used instead of whatever configuration might be already present
+	// in the filesystem.
+	snap, err := pf.ReadConfigSnapshot()
+	if err != nil {
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			errSummary,
+			fmt.Sprintf("Failed to read configuration snapshot from plan file: %s.", err),
+		))
+	}
+	loader := configload.NewLoaderFromSnapshot(snap)
+	config, configDiags := loader.LoadConfig(snap.Modules[""].Dir)
+	diags = diags.Append(configDiags)
+	sources := loader.Sources()
+	if configDiags.HasErrors() {
+		return nil, sources, diags
+	}
+	opts.Config = config
+
+	plan, err := pf.ReadPlan()
+	if err != nil {
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			errSummary,
+			fmt.Sprintf("Failed to read plan from plan file: %s.", err),
+		))
+	}
+
+	variables := terraform.InputValues{}
+	for name, dyVal := range plan.VariableValues {
+		ty, err := dyVal.ImpliedType()
+		if err != nil {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				errSummary,
+				fmt.Sprintf("Invalid value for variable %q recorded in plan file: %s.", err),
+			))
+			continue
+		}
+		val, err := dyVal.Decode(ty)
+		if err != nil {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				errSummary,
+				fmt.Sprintf("Invalid value for variable %q recorded in plan file: %s.", err),
+			))
+			continue
+		}
+
+		variables[name] = &terraform.InputValue{
+			Value:      val,
+			SourceType: terraform.ValueFromPlan,
+		}
+	}
+	opts.Variables = variables
+
+	// TODO: populate the changes (formerly diff)
+	// TODO: targets
+	// TODO: check that the states match
+	// TODO: impose provider SHA256 constraints
+
+	tfCtx, ctxDiags := terraform.NewContext(&opts)
+	diags = diags.Append(ctxDiags)
+	return tfCtx, sources, diags
 }
 
 const validateWarnHeader = `

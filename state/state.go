@@ -1,19 +1,16 @@
 package state
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"math/rand"
 	"os"
 	"os/user"
 	"strings"
-	"text/template"
 	"time"
 
 	uuid "github.com/hashicorp/go-uuid"
+	"github.com/hashicorp/terraform/states/statemgr"
 	"github.com/hashicorp/terraform/terraform"
 	"github.com/hashicorp/terraform/version"
 )
@@ -165,64 +162,7 @@ func NewLockInfo() *LockInfo {
 	return info
 }
 
-// LockInfo stores lock metadata.
-//
-// Only Operation and Info are required to be set by the caller of Lock.
-type LockInfo struct {
-	// Unique ID for the lock. NewLockInfo provides a random ID, but this may
-	// be overridden by the lock implementation. The final value if ID will be
-	// returned by the call to Lock.
-	ID string
-
-	// Terraform operation, provided by the caller.
-	Operation string
-	// Extra information to store with the lock, provided by the caller.
-	Info string
-
-	// user@hostname when available
-	Who string
-	// Terraform version
-	Version string
-	// Time that the lock was taken.
-	Created time.Time
-
-	// Path to the state file when applicable. Set by the Lock implementation.
-	Path string
-}
-
-// Err returns the lock info formatted in an error
-func (l *LockInfo) Err() error {
-	return errors.New(l.String())
-}
-
-// Marshal returns a string json representation of the LockInfo
-func (l *LockInfo) Marshal() []byte {
-	js, err := json.Marshal(l)
-	if err != nil {
-		panic(err)
-	}
-	return js
-}
-
-// String return a multi-line string representation of LockInfo
-func (l *LockInfo) String() string {
-	tmpl := `Lock Info:
-  ID:        {{.ID}}
-  Path:      {{.Path}}
-  Operation: {{.Operation}}
-  Who:       {{.Who}}
-  Version:   {{.Version}}
-  Created:   {{.Created}}
-  Info:      {{.Info}}
-`
-
-	t := template.Must(template.New("LockInfo").Parse(tmpl))
-	var out bytes.Buffer
-	if err := t.Execute(&out, l); err != nil {
-		panic(err)
-	}
-	return out.String()
-}
+type LockInfo = statemgr.LockInfo
 
 type LockError struct {
 	Info *LockInfo

@@ -46,12 +46,12 @@ func (c *GraphCommand) Run(args []string) int {
 	}
 
 	// Check if the path is a plan
-	plan, err := c.Plan(configPath)
+	planFile, err := c.PlanFile(configPath)
 	if err != nil {
 		c.Ui.Error(err.Error())
 		return 1
 	}
-	if plan != nil {
+	if planFile != nil {
 		// Reset for backend loading
 		configPath = ""
 	}

@@ -12,7 +12,6 @@ import (
 	"github.com/hashicorp/terraform/addrs"
 	"github.com/hashicorp/terraform/backend"
 	"github.com/hashicorp/terraform/config"
-	"github.com/hashicorp/terraform/configs"
 	"github.com/hashicorp/terraform/terraform"
 	"github.com/hashicorp/terraform/tfdiags"
 )
@@ -45,8 +44,7 @@ func (c *ApplyCommand) Run(args []string) int {
 		cmdFlags.BoolVar(&destroyForce, "force", false, "deprecated: same as auto-approve")
 	}
 	cmdFlags.BoolVar(&refresh, "refresh", true, "refresh")
-	cmdFlags.IntVar(
-		&c.Meta.parallelism, "parallelism", DefaultParallelism, "parallelism")
+	cmdFlags.IntVar(&c.Meta.parallelism, "parallelism", DefaultParallelism, "parallelism")
 	cmdFlags.StringVar(&c.Meta.statePath, "state", "", "path")
 	cmdFlags.StringVar(&c.Meta.stateOutPath, "state-out", "", "path")
 	cmdFlags.StringVar(&c.Meta.backupPath, "backup", "", "path")
@@ -84,8 +82,7 @@ func (c *ApplyCommand) Run(args []string) int {
 
 		// Do a detect to determine if we need to do an init + apply.
 		if detected, err := getter.Detect(configPath, pwd, getter.Detectors); err != nil {
-			c.Ui.Error(fmt.Sprintf(
-				"Invalid path: %s", err))
+			c.Ui.Error(fmt.Sprintf("Invalid path: %s", err))
 			return 1
 		} else if !strings.HasPrefix(detected, "file") {
 			// If this isn't a file URL then we're doing an init +
@@ -102,39 +99,47 @@ func (c *ApplyCommand) Run(args []string) int {
 	}
 
 	// Check if the path is a plan
-	plan, err := c.Plan(configPath)
+	planFile, err := c.PlanFile(configPath)
 	if err != nil {
 		c.Ui.Error(err.Error())
 		return 1
 	}
-	if c.Destroy && plan != nil {
-		c.Ui.Error(fmt.Sprintf(
-			"Destroy can't be called with a plan file."))
+	if c.Destroy && planFile != nil {
+		c.Ui.Error(fmt.Sprintf("Destroy can't be called with a plan file."))
 		return 1
 	}
-	if plan != nil {
+	if planFile != nil {
 		// Reset the config path for backend loading
 		configPath = ""
 	}
 
 	var diags tfdiags.Diagnostics
 
-	var backendConfig *configs.Backend
-	if plan == nil {
-		var configDiags tfdiags.Diagnostics
-		backendConfig, configDiags = c.loadBackendConfig(configPath)
+	// Load the backend
+	var backend backend.Enhanced
+	var beDiags tfdiags.Diagnostics
+	if planFile == nil {
+		backendConfig, configDiags := c.loadBackendConfig(configPath)
 		diags = diags.Append(configDiags)
 		if configDiags.HasErrors() {
 			c.showDiagnostics(diags)
 			return 1
 		}
-	}
 
-	// Load the backend
-	b, beDiags := c.Backend(&BackendOpts{
-		Config: backendConfig,
-		Plan:   plan,
-	})
+		backend, beDiags = c.Backend(&BackendOpts{
+			Config: backendConfig,
+		})
+	} else {
+		plan, err := planFile.ReadPlan()
+		if err != nil {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Failed to read plan from plan file",
+				fmt.Sprintf("Cannot read the plan from the given plan file: %s.", err),
+			))
+		}
+		backend, beDiags = c.BackendForPlan(plan.Backend)
+	}
 	diags = diags.Append(beDiags)
 	if beDiags.HasErrors() {
 		c.showDiagnostics(diags)

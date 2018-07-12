@@ -76,6 +76,17 @@ func (s *State) EnsureModule(addr addrs.ModuleInstance) *Module {
 	return ms
 }
 
+// HasResources returns true if there is at least one resource (of any mode)
+// present in the receiving state.
+func (s *State) HasResources() bool {
+	for _, ms := range s.Modules {
+		if len(ms.Resources) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // Resource returns the state for the resource with the given address, or nil
 // if no such resource is tracked in the state.
 func (s *State) Resource(addr addrs.AbsResource) *Resource {
